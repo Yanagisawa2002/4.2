@@ -145,6 +145,30 @@ class HOTrainLoader:
         return len(self._loader)
 
 
+class HOPretrainLoader:
+    def __init__(
+        self,
+        dataset: TensorDataset,
+        batch_sampler: _BalancedHOBatchSampler,
+        num_workers: int = 0,
+    ) -> None:
+        self._batch_sampler = batch_sampler
+        self._loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+        )
+
+    def set_epoch(self, epoch: int) -> None:
+        self._batch_sampler.set_epoch(epoch)
+
+    def __iter__(self):
+        return iter(self._loader)
+
+    def __len__(self) -> int:
+        return len(self._loader)
+
+
 @dataclass(frozen=True)
 class RGCNGraph:
     node_to_local: Dict[str, Dict[str, int]]
@@ -230,6 +254,63 @@ class BaseDataBundle:
         )
 
 
+@dataclass(frozen=True)
+class MotifPretrainBundle:
+    graph: RGCNGraph
+    ho_train: HOSplitData
+
+    def make_ho_pretrain_loader(
+        self,
+        batch_size: int,
+        seed: int,
+        balance_key: str = "drug",
+        num_workers: int = 0,
+    ) -> HOPretrainLoader:
+        assert_ho_train_only(("train",))
+        if balance_key not in {"drug", "disease"}:
+            raise ValueError("balance_key must be one of {'drug', 'disease'}.")
+        if self.ho_train.total == 0:
+            raise ValueError("ho_train is empty; cannot create HO pretrain loader.")
+
+        if balance_key == "drug":
+            key_tensor = self.ho_train.drug_index
+        else:
+            key_tensor = self.ho_train.disease_index
+        batch_sampler = _BalancedHOBatchSampler(
+            key_indices=key_tensor.tolist(),
+            batch_size=batch_size,
+            seed=seed,
+        )
+        dataset = TensorDataset(
+            self.ho_train.drug_index,
+            self.ho_train.protein_index,
+            self.ho_train.pathway_index,
+            self.ho_train.disease_index,
+        )
+        return HOPretrainLoader(
+            dataset=dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+        )
+
+    def get_corruption_node_pools(self) -> Dict[str, torch.LongTensor]:
+        return {
+            "drug": _global_node_pool_for_types(graph=self.graph, allowed_types=("drug",)),
+            "protein": _global_node_pool_for_types(
+                graph=self.graph,
+                allowed_types=("gene/protein", "protein"),
+            ),
+            "pathway": _global_node_pool_for_types(
+                graph=self.graph,
+                allowed_types=("pathway",),
+            ),
+            "disease": _global_node_pool_for_types(
+                graph=self.graph,
+                allowed_types=("disease",),
+            ),
+        }
+
+
 def prepare_base_data(
     node_types_path: str | Path,
     kg_edges_path: str | Path,
@@ -264,6 +345,49 @@ def prepare_base_data(
         graph=graph,
         pair_splits=pair_splits,
         ho_splits=ho_splits,
+    )
+
+
+def prepare_motif_pretrain_data(
+    node_types_path: str | Path,
+    kg_edges_path: str | Path,
+    split_dir: str | Path,
+    indication_relation: str = "indication",
+    keep_only_train_indication: bool = True,
+) -> MotifPretrainBundle:
+    split_dir = Path(split_dir)
+    assert_ho_train_only(("train",))
+
+    node_type_map = load_node_type_mapping(node_types_path)
+    kg_pos_train = _read_pair_edge_file(split_dir / "kg_pos_train.csv")
+    train_pos_pairs = set(kg_pos_train)
+    kg_edges = load_kg_edges(
+        kg_edges_path=kg_edges_path,
+        node_type_map=node_type_map,
+        indication_relation=indication_relation,
+        train_positive_pairs=train_pos_pairs,
+        keep_only_train_indication=keep_only_train_indication,
+    )
+    graph = build_rgcn_graph(node_type_map=node_type_map, kg_edges=kg_edges)
+    ho_train_quads = _read_ho_quad_file(split_dir / "ho_train.csv")
+    assert_ho_alignment(ho_train=ho_train_quads, kg_pos_train=kg_pos_train)
+
+    protein_freq: Dict[str, int] = defaultdict(int)
+    pathway_freq: Dict[str, int] = defaultdict(int)
+    for _, protein, pathway, _ in ho_train_quads:
+        protein_freq[protein] += 1
+        pathway_freq[pathway] += 1
+
+    ho_train = _build_ho_split_data(
+        split_name="train",
+        quads=ho_train_quads,
+        graph=graph,
+        protein_freq=protein_freq,
+        pathway_freq=pathway_freq,
+    )
+    return MotifPretrainBundle(
+        graph=graph,
+        ho_train=ho_train,
     )
 
 
@@ -596,70 +720,86 @@ def load_ho_splits(
 
     split_data: Dict[str, HOSplitData] = {}
     for split_name in SPLIT_NAMES:
-        quads = tuple(ho_quads_by_split[split_name])
-        drug_indices: List[int] = []
-        protein_indices: List[int] = []
-        pathway_indices: List[int] = []
-        disease_indices: List[int] = []
-        weights: List[float] = []
-
-        for quad in quads:
-            drug, protein, pathway, disease = quad
-            drug_indices.append(
-                _resolve_global_node_index(
-                    graph=graph,
-                    node_id=drug,
-                    allowed_types=("drug",),
-                    context=f"ho_{split_name}",
-                )
-            )
-            protein_indices.append(
-                _resolve_global_node_index(
-                    graph=graph,
-                    node_id=protein,
-                    allowed_types=("gene/protein", "protein"),
-                    context=f"ho_{split_name}",
-                )
-            )
-            pathway_indices.append(
-                _resolve_global_node_index(
-                    graph=graph,
-                    node_id=pathway,
-                    allowed_types=("pathway",),
-                    context=f"ho_{split_name}",
-                )
-            )
-            disease_indices.append(
-                _resolve_global_node_index(
-                    graph=graph,
-                    node_id=disease,
-                    allowed_types=("disease",),
-                    context=f"ho_{split_name}",
-                )
-            )
-
-            if split_name == "train":
-                denom = protein_freq[protein] + pathway_freq[pathway]
-                if denom <= 0:
-                    raise ValueError(
-                        "Invalid HO train frequency denominator for quad "
-                        f"{quad}: protein_freq={protein_freq[protein]}, "
-                        f"pathway_freq={pathway_freq[pathway]}"
-                    )
-                weights.append(1.0 / math.sqrt(float(denom)))
-            else:
-                weights.append(1.0)
-
-        split_data[split_name] = HOSplitData(
-            quadruplets=quads,
-            drug_index=torch.tensor(drug_indices, dtype=torch.long),
-            protein_index=torch.tensor(protein_indices, dtype=torch.long),
-            pathway_index=torch.tensor(pathway_indices, dtype=torch.long),
-            disease_index=torch.tensor(disease_indices, dtype=torch.long),
-            weight=torch.tensor(weights, dtype=torch.float32),
+        split_data[split_name] = _build_ho_split_data(
+            split_name=split_name,
+            quads=ho_quads_by_split[split_name],
+            graph=graph,
+            protein_freq=protein_freq,
+            pathway_freq=pathway_freq,
         )
 
     return split_data
+
+
+def _build_ho_split_data(
+    split_name: str,
+    quads: Sequence[HOQuad],
+    graph: RGCNGraph,
+    protein_freq: Mapping[str, int],
+    pathway_freq: Mapping[str, int],
+) -> HOSplitData:
+    quads_tuple = tuple(quads)
+    drug_indices: List[int] = []
+    protein_indices: List[int] = []
+    pathway_indices: List[int] = []
+    disease_indices: List[int] = []
+    weights: List[float] = []
+
+    for quad in quads_tuple:
+        drug, protein, pathway, disease = quad
+        drug_indices.append(
+            _resolve_global_node_index(
+                graph=graph,
+                node_id=drug,
+                allowed_types=("drug",),
+                context=f"ho_{split_name}",
+            )
+        )
+        protein_indices.append(
+            _resolve_global_node_index(
+                graph=graph,
+                node_id=protein,
+                allowed_types=("gene/protein", "protein"),
+                context=f"ho_{split_name}",
+            )
+        )
+        pathway_indices.append(
+            _resolve_global_node_index(
+                graph=graph,
+                node_id=pathway,
+                allowed_types=("pathway",),
+                context=f"ho_{split_name}",
+            )
+        )
+        disease_indices.append(
+            _resolve_global_node_index(
+                graph=graph,
+                node_id=disease,
+                allowed_types=("disease",),
+                context=f"ho_{split_name}",
+            )
+        )
+
+        if split_name == "train":
+            denom = protein_freq[protein] + pathway_freq[pathway]
+            if denom <= 0:
+                raise ValueError(
+                    "Invalid HO train frequency denominator for quad "
+                    f"{quad}: protein_freq={protein_freq[protein]}, "
+                    f"pathway_freq={pathway_freq[pathway]}"
+                )
+            weights.append(1.0 / math.sqrt(float(denom)))
+        else:
+            weights.append(1.0)
+
+    return HOSplitData(
+        quadruplets=quads_tuple,
+        drug_index=torch.tensor(drug_indices, dtype=torch.long),
+        protein_index=torch.tensor(protein_indices, dtype=torch.long),
+        pathway_index=torch.tensor(pathway_indices, dtype=torch.long),
+        disease_index=torch.tensor(disease_indices, dtype=torch.long),
+        weight=torch.tensor(weights, dtype=torch.float32),
+    )
 
 
 def _read_pair_edge_file(path: Path) -> List[Edge]:
@@ -742,6 +882,22 @@ def _resolve_global_node_index(
     raise ValueError(
         f"{context} references unknown node '{node_id}' for allowed types {tuple(allowed_types)}"
     )
+
+
+def _global_node_pool_for_types(
+    graph: RGCNGraph,
+    allowed_types: Sequence[str],
+) -> torch.LongTensor:
+    global_indices: List[int] = []
+    for node_type in allowed_types:
+        count = graph.num_nodes_by_type.get(node_type, 0)
+        if count <= 0:
+            continue
+        offset = graph.node_offsets[node_type]
+        global_indices.extend(range(offset, offset + count))
+    if not global_indices:
+        raise ValueError(f"No nodes available for allowed_types={tuple(allowed_types)}")
+    return torch.tensor(global_indices, dtype=torch.long)
 
 
 def _ordered_node_types(types: Iterable[str]) -> List[str]:

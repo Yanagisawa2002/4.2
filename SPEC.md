@@ -244,4 +244,12 @@ Until further notice:
 - Do not assume “standard IO” column names unless explicitly mapped.
 - Treat this section as authoritative for current project IO.
 
+11. Runtime Constraint (Local vs Cloud)
+
+Local machine constraint (non-negotiable for this project):
+
+- The local machine is resource-limited (lightweight laptop).
+- Do NOT run smoke tests, training, or any compute-heavy validation locally.
+- Only provide runnable commands; execution must be done on cloud/remote compute by the user.
+
 END OF SPEC

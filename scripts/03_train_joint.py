@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import random
 import sys
-from typing import Dict
+from typing import Dict, Mapping
 
 import numpy as np
 import torch
@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-ho", type=float, default=0.1)
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument(
+        "--init-from",
+        default=None,
+        help=(
+            "Optional checkpoint path for weight initialization. Supports checkpoints "
+            "with encoder_state_dict/model_state_dict/state_dict."
+        ),
+    )
+    parser.add_argument(
         "--balance-key",
         default="drug",
         choices=["drug", "disease"],
@@ -115,6 +123,68 @@ def resolve_device(device_arg: str) -> torch.device:
     if device_arg == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_arg)
+
+
+def _extract_state_dict(payload: object) -> tuple[Mapping[str, torch.Tensor], str]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("Checkpoint payload must be a mapping.")
+
+    for key in ("encoder_state_dict", "model_state_dict", "state_dict"):
+        candidate = payload.get(key)
+        if isinstance(candidate, Mapping):
+            tensor_values = [isinstance(v, torch.Tensor) for v in candidate.values()]
+            if tensor_values and all(tensor_values):
+                return candidate, key
+
+    tensor_values = [isinstance(v, torch.Tensor) for v in payload.values()]
+    if tensor_values and all(tensor_values):
+        return payload, "root"
+
+    raise ValueError(
+        "Could not locate a tensor state_dict in checkpoint. "
+        "Tried keys: encoder_state_dict, model_state_dict, state_dict."
+    )
+
+
+def load_init_weights(
+    model: BaseRGCNPairModel,
+    init_path: str | Path,
+) -> Dict[str, object]:
+    checkpoint = torch.load(init_path, map_location="cpu")
+    source_state, source_name = _extract_state_dict(checkpoint)
+    target_state = model.state_dict()
+
+    loaded = 0
+    skipped_missing = 0
+    skipped_shape = 0
+    filtered_state: Dict[str, torch.Tensor] = {}
+    for key, tensor in source_state.items():
+        target_tensor = target_state.get(key)
+        if target_tensor is None:
+            skipped_missing += 1
+            continue
+        if target_tensor.shape != tensor.shape:
+            skipped_shape += 1
+            continue
+        filtered_state[key] = tensor
+        loaded += 1
+
+    if loaded == 0:
+        raise ValueError(
+            f"No compatible weights found in {init_path}. "
+            f"source={source_name}, missing={skipped_missing}, shape_mismatch={skipped_shape}"
+        )
+
+    merged = dict(target_state)
+    merged.update(filtered_state)
+    model.load_state_dict(merged)
+    return {
+        "path": str(init_path),
+        "source": source_name,
+        "loaded_keys": loaded,
+        "skipped_missing": skipped_missing,
+        "skipped_shape": skipped_shape,
+    }
 
 
 def _to_ho_batch(
@@ -361,6 +431,10 @@ def main() -> None:
         dropout=args.dropout,
     )
     model = BaseRGCNPairModel(config).to(device)
+    init_stats: Dict[str, object] | None = None
+    if args.init_from is not None:
+        init_stats = load_init_weights(model=model, init_path=args.init_from)
+        print(json.dumps({"init": init_stats}))
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,
@@ -454,6 +528,7 @@ def main() -> None:
         "seed": args.seed,
         "split_type": args.split_type,
         "indication_relation": args.indication_relation,
+        "init": init_stats,
         "best_epoch": best_epoch,
         "lambda_ho": args.lambda_ho,
         "tau": args.tau,
