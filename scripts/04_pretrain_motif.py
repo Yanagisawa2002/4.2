@@ -84,9 +84,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--corruption-modes",
         nargs="+",
-        default=list(MOTIF_COMPONENTS),
+        default=["protein", "pathway"],
         choices=list(MOTIF_COMPONENTS),
-        help="Allowed single-component corruption modes.",
+        help=(
+            "Allowed single-component corruption modes. "
+            "Default applies Scheme-A: protein/pathway only."
+        ),
+    )
+    parser.add_argument(
+        "--mode-sampling",
+        default="balanced",
+        choices=["balanced", "uniform"],
+        help=(
+            "How to sample corruption modes per batch. "
+            "'balanced' keeps mode usage nearly 50/50 when two modes are used."
+        ),
     )
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -228,6 +240,7 @@ def train_one_epoch(
     tau: float,
     num_corruptions: int,
     corruption_modes: Sequence[str],
+    mode_sampling: str,
     rng: torch.Generator,
     epoch: int,
     total_epochs: int,
@@ -264,6 +277,7 @@ def train_one_epoch(
             num_corruptions=num_corruptions,
             generator=rng,
             corruption_modes=corruption_modes,
+            mode_sampling=mode_sampling,
         )
         ho_batch = {key: value.to(device) for key, value in ho_batch_cpu.items()}
         corrupted_batch = {key: value.to(device) for key, value in corruption.corrupted.items()}
@@ -306,6 +320,7 @@ def train_one_epoch(
         "loss": total_loss / total_count,
         "num_quads": float(total_count),
         "num_corruptions": float(total_corruptions),
+        "mode_sampling": mode_sampling,
         "corruption_modes": {mode: float(mode_counts[mode]) for mode in corruption_modes},
         "unchanged_corruptions": float(unchanged_count),
         "unchanged_rate": float(unchanged_count / total_corruptions if total_corruptions else 0.0),
@@ -402,6 +417,7 @@ def main() -> None:
             tau=args.tau,
             num_corruptions=args.num_corruptions,
             corruption_modes=args.corruption_modes,
+            mode_sampling=args.mode_sampling,
             rng=rng,
             epoch=epoch,
             total_epochs=args.epochs,
@@ -412,6 +428,7 @@ def main() -> None:
             "loss": stats["loss"],
             "num_quads": stats["num_quads"],
             "num_corruptions": stats["num_corruptions"],
+            "mode_sampling": stats["mode_sampling"],
             "corruption_modes": stats["corruption_modes"],
             "unchanged_corruptions": stats["unchanged_corruptions"],
             "unchanged_rate": stats["unchanged_rate"],
@@ -450,6 +467,8 @@ def main() -> None:
         "seed": args.seed,
         "best_epoch": best_epoch,
         "best_loss": best_loss,
+        "mode_sampling": args.mode_sampling,
+        "corruption_modes": list(args.corruption_modes),
         "split_dir": args.split_dir,
         "save_ckpt": str(ckpt_path),
         "ho_train_size": bundle.ho_train.total,

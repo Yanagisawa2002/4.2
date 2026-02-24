@@ -88,12 +88,15 @@ def sample_corrupted_quadruplets(
     num_corruptions: int,
     generator: torch.Generator,
     corruption_modes: Sequence[str] = MOTIF_COMPONENTS,
+    mode_sampling: str = "uniform",
     max_resample_attempts: int = 8,
 ) -> CorruptionResult:
     if num_corruptions <= 0:
         raise ValueError("num_corruptions must be > 0")
     if not corruption_modes:
         raise ValueError("corruption_modes must be non-empty")
+    if mode_sampling not in {"uniform", "balanced"}:
+        raise ValueError("mode_sampling must be one of {'uniform', 'balanced'}.")
 
     for mode in corruption_modes:
         if mode not in _COMPONENT_TO_KEY:
@@ -118,13 +121,19 @@ def sample_corrupted_quadruplets(
             )
 
     mode_count = len(corruption_modes)
-    mode_index_cpu = torch.randint(
-        low=0,
-        high=mode_count,
-        size=(batch_size, num_corruptions),
-        generator=generator,
-        dtype=torch.long,
-    )
+    if mode_sampling == "uniform":
+        mode_index_cpu = torch.randint(
+            low=0,
+            high=mode_count,
+            size=(batch_size, num_corruptions),
+            generator=generator,
+            dtype=torch.long,
+        )
+    else:
+        total_slots = batch_size * num_corruptions
+        repeated_modes = torch.arange(total_slots, dtype=torch.long) % mode_count
+        shuffle_index = torch.randperm(total_slots, generator=generator)
+        mode_index_cpu = repeated_modes[shuffle_index].reshape(batch_size, num_corruptions)
 
     expanded_cpu: Dict[str, torch.LongTensor] = {}
     for key in _COMPONENT_TO_KEY.values():
